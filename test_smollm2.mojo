@@ -10,8 +10,8 @@ from std.pathlib import Path
 from std.time import perf_counter_ns
 
 from tokenizer import load_tokenizer
-from experimental4.smollm2 import LogitsView, SmolLM2Config, BF16
-from experimental4.smollm2_tp import SmolLM2TP
+from experimental4.smollm2_tp import LogitsView, SmolLM2Config, SmolLM2TP
+from experimental4.model_spec import BF16
 
 
 comptime TOKENIZER_PATH = "checkpoints/SmolLM2/tokenizer.json"

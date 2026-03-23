@@ -20,12 +20,13 @@ from threading import BurstPool
 
 from experimental4.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32,
-    ShardStrategy, RowShard, ColShard, Replicated,
+    RowShard, ColShard, Replicated,
     PrincipleNodeLocal,
     Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
     WeightIterable,
     next_offset,
     DEFAULT_ALIGNMENT,
+    Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig,
 )
 from experimental4.kernel_ops import (
     gemm, rmsnorm, embed_lookup, silu_mul, elem_add, rope, kv_cache_write,
@@ -34,7 +35,58 @@ from experimental4.kernel_ops import (
 )
 from experimental4.loader import load_safetensors
 from experimental4.profiler import Profiler
-from experimental4.smollm2 import SmolLM2Config, LogitsView, LogitAccess
+
+
+# =============================================================================
+# Shared types: model config, logit access
+# =============================================================================
+
+
+trait LogitAccess:
+    """Read-only access to model output logits.
+    VOCAB is comptime for SIMD loop bounds. rows() is runtime
+    (1 for decode, N for prefill). load_f32 upcasts from storage
+    dtype so consumers always work in f32."""
+    comptime DTYPE: DType
+    comptime VOCAB: Int
+    def rows(self) -> Int: ...
+    def load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]: ...
+
+
+@fieldwise_init
+struct LogitsView[vocab: Int, dtype: DType = DType.bfloat16](LogitAccess):
+    """Non-owning, read-only view of logits in arena scratch memory.
+    Valid only while the backing arena is alive."""
+    comptime DTYPE = Self.dtype
+    comptime VOCAB = Self.vocab
+    var ptr: Int
+    var seq_len: Int
+
+    def rows(self) -> Int:
+        return self.seq_len
+
+    def load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]:
+        var p = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
+            unsafe_from_address=self.ptr
+        )
+        return (p + row * Self.vocab + offset).load[width=width]().cast[DType.float32]()
+
+
+struct SmolLM2Config(Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig):
+    comptime HIDDEN = 576
+    comptime NUM_LAYERS = 30
+    comptime NUM_HEADS = 9
+    comptime NUM_KV_HEADS = 3
+    comptime INTERMEDIATE = 1536
+    comptime VOCAB_SIZE = 49152
+    comptime MAX_SEQ_LEN = 8192
+    comptime ROPE_THETA = 100000.0
+    comptime RMS_NORM_EPS = 1e-5
+    comptime TIE_EMBEDDINGS = True
+
+    comptime HEAD_DIM = Self.HIDDEN // Self.NUM_HEADS
+    comptime KV_HIDDEN = Self.NUM_KV_HEADS * Self.HEAD_DIM
+    comptime GQA_FACTOR = Self.NUM_HEADS // Self.NUM_KV_HEADS
 
 
 # =============================================================================
@@ -61,17 +113,17 @@ struct TPLayer[E: Encoding, tp: Int]:
 
     @staticmethod
     def for_each_weight[
-        func: def[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](prefix: String, base: Int):
-        func[RowShard, Self.Q_PROJ](prefix, base)
-        func[RowShard, Self.K_PROJ](prefix, base)
-        func[RowShard, Self.V_PROJ](prefix, base)
-        func[ColShard, Self.O_PROJ](prefix, base)
-        func[RowShard, Self.GATE_PROJ](prefix, base)
-        func[RowShard, Self.UP_PROJ](prefix, base)
-        func[ColShard, Self.DOWN_PROJ](prefix, base)
-        func[Replicated, Self.INPUT_NORM](prefix, base)
-        func[Replicated, Self.POST_ATTN_NORM](prefix, base)
+        func[Self.Q_PROJ](prefix, base)
+        func[Self.K_PROJ](prefix, base)
+        func[Self.V_PROJ](prefix, base)
+        func[Self.O_PROJ](prefix, base)
+        func[Self.GATE_PROJ](prefix, base)
+        func[Self.UP_PROJ](prefix, base)
+        func[Self.DOWN_PROJ](prefix, base)
+        func[Self.INPUT_NORM](prefix, base)
+        func[Self.POST_ATTN_NORM](prefix, base)
 
     @staticmethod
     def cache_bytes() -> Int:
@@ -129,14 +181,14 @@ struct TPModel[E: Encoding, tp: Int](WeightIterable):
 
     @staticmethod
     def for_each_weight[
-        func: def[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ]():
         comptime for i in range(C.NUM_LAYERS):
             var prefix = "model.layers." + String(i) + "."
             var base = Self.LAYERS_OFF + i * Self.LAYER_STRIDE
             Self.LAYER.for_each_weight[func](prefix, base)
-        func[PrincipleNodeLocal, Self.FINAL_NORM]("", 0)
-        func[PrincipleNodeLocal, Self.EMBED]("", 0)
+        func[Self.FINAL_NORM]("", 0)
+        func[Self.EMBED]("", 0)
 
     @staticmethod
     def arena_bytes() -> Int:
@@ -382,9 +434,9 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
         self.arenas = arenas^
         self.pools = pools^
         for rank in range(Self.tp):
-            self.bases[rank] = Int(self.arenas[rank][].base)
+            self.bases[rank] = Int(self.arenas[rank].base)
             self.pool_ptrs[rank] = UnsafePointer[BurstPool[], MutAnyOrigin](
-                unsafe_from_address=Int(self.pools[rank])
+                unsafe_from_address=Int(UnsafePointer(to=self.pools[rank]))
             )
 
     def rank(self, r: Int) -> RankView[Self.E, Self.tp]:
@@ -414,7 +466,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
         var arena_bases = List[Int]()
         for rank in range(Self.tp):
-            arena_bases.append(Int(arenas[rank][].base))
+            arena_bases.append(Int(arenas[rank].base))
 
         var result = load_safetensors[Self.M](path, arena_bases, host_index=host_rank)
         if not result:
@@ -422,7 +474,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
             return None
 
         for rank in range(Self.tp):
-            _ = arenas[rank][].prefault(Self.M.DISTRIBUTED_BYTES, Self.M.STATE_BYTES)
+            _ = arenas[rank].prefault(Self.M.DISTRIBUTED_BYTES, Self.M.STATE_BYTES)
 
         var pools = HeapMoveArray[BurstPool[]](Self.tp)
         for rank in range(Self.tp):
