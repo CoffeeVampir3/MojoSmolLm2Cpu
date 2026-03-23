@@ -1,5 +1,11 @@
 Zero dependency mojo library for running SmolLm2 on the CPU. This includes zero dependencies on libc or similar, allowing the full pipeline to be vectorized correctly without any expected hiccups. This is a proof of concept for how CPU-facing concepts work and what infrastructure is actually needed to run the model directly from a huggingface checkpoint. There's a few goals of the project, but the primary one is to build up to a fully numa-aware execution model for running large models on server-grade cpus. This requires some specialized engineer that's usually not employed particularly in the handling of numa domains which can get you 2-3x bandwidth improvements by being intentional about the design.
 
+|              | HuggingFace | Mojo   | Speedup |
+|--------------|-------------|--------|---------|
+| Model load   | 209 ms      | 85 ms  | 2.5×    |
+| Prefill      | 392 t/s     | 404 t/s| 1.03×   |
+| Decode       | 55 t/s      | 92 t/s | 1.67×   |
+
 ### Get Model
 
 To execute first you'll need to get the weights, to do this easily use:
