@@ -1,5 +1,7 @@
 Zero dependency mojo library for running SmolLm2 on the CPU. This includes zero dependencies on libc or similar, allowing the full pipeline to be vectorized correctly without any expected hiccups. This is a proof of concept for how CPU-facing concepts work and what infrastructure is actually needed to run the model directly from a huggingface checkpoint. There's a few goals of the project, but the primary one is to build up to a fully numa-aware execution model for running large models on server-grade cpus. This requires some specialized engineer that's usually not employed particularly in the handling of numa domains which can get you 2-3x bandwidth improvements by being intentional about the design.
 
+### Get Model
+
 To execute first you'll need to get the weights, to do this easily use:
 
 ```
@@ -11,6 +13,21 @@ This just runs the included python script to download the weights using uv, you 
 uv run python --project model_downloader/download_model.py
 ```
 Or just download the weights manually: https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/tree/main
+
+### Execute
+
+I'd recommend using mojo's pixi installation.
+
+Build:
+```
+pixi run mojo build test_smollm2.mojo
+```
+
+Run:
+```
+./test_smollm2
+```
+
 
 ### Runtime Design
 
