@@ -1,21 +1,73 @@
 """Operations as free functions on typed views.
 
-Weights: Bound[T] (comptime dims, bf16).
-Activations: DynView[T] (runtime seq_len, comptime cols, bf16).
-KV Cache: CacheView[T] (comptime dims, bf16).
+Pool-dispatched kernels return PoolFence — a linear type (@explicit_destroy)
+representing in-flight work. Must be consumed via .join() or parallel().
 
-All ops enforce bf16 compute, dimensional correctness, and SIMD
-alignment at compile time via where clauses and constrained[].
+TP=1: gemm(...).join()
+TP=N: parallel(gemm(..., pool0), gemm(..., pool1), gemm(..., pool2))
 """
 
-from math import sqrt
-from memory import UnsafePointer
-from sys.info import simd_width_of
+from std.math import sqrt
+from std.memory import UnsafePointer
+from std.sys.info import simd_width_of
 from threading import BurstPool
+import linux.sys as linux
 
 from experimental4.model_spec import (
     Encoding, Shaped, Bound, DynView, CacheView,
 )
+
+
+# ================================================================
+# POOL FENCE — linear synchronization token
+# ================================================================
+
+
+@explicit_destroy
+@fieldwise_init
+struct PoolFence(Movable):
+    """Linear token for in-flight pool work. Unconsumed fences are a compile error.
+
+    Three consumption paths:
+        .join()  — wait immediately (TP=1)
+        .take()  — extract raw pool ptr for deferred batch join (parametric TP)
+        parallel(f0, f1, ...) — variadic barrier (fixed TP)
+    """
+    var pool: UnsafePointer[BurstPool[], MutAnyOrigin]
+
+    @staticmethod
+    def completed() -> Self:
+        return Self(UnsafePointer[BurstPool[], MutAnyOrigin]())
+
+    def join(deinit self):
+        """Consume fence, wait for work to complete."""
+        if self.pool:
+            self.pool[].join()
+
+    def take(deinit self) -> UnsafePointer[BurstPool[], MutAnyOrigin]:
+        """Consume fence, return raw pool pointer for deferred join."""
+        return self.pool
+
+
+def parallel(var *fences: PoolFence):
+    """Variadic barrier: joins all fences, consuming each."""
+    @parameter
+    def do_join(idx: Int, var fence: PoolFence) capturing:
+        fence^.join()
+    fences^.consume_elements[do_join]()
+
+
+def parallel_for[tp: Int, body: def[rank: Int] () capturing -> PoolFence]():
+    """Parametric barrier: dispatch body[rank]() for each rank, then join all.
+    Works for any TP degree. body returns PoolFence — consumed internally via .take()."""
+    var ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp](
+        fill=UnsafePointer[BurstPool[], MutAnyOrigin]()
+    )
+    comptime for rank in range(tp):
+        ptrs[rank] = body[rank]().take()
+    for i in range(tp):
+        if ptrs[i]:
+            ptrs[i][].join()
 
 
 # ================================================================
@@ -30,7 +82,7 @@ from experimental4.model_spec import (
 
 
 @always_inline
-fn bf16_to_f32[
+def bf16_to_f32[
     width: Int
 ](ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin], offset: Int) -> SIMD[
     DType.float32, width
@@ -53,7 +105,7 @@ struct SinCosResult[width: Int = 1]:
     var cos_val: SIMD[DType.float64, Self.width]
 
 
-fn sincos[width: Int = 1](angles: SIMD[DType.float64, width]) -> SinCosResult[width]:
+def sincos[width: Int = 1](angles: SIMD[DType.float64, width]) -> SinCosResult[width]:
     """Compute sin/cos via Chebyshev minimax polynomials. SIMD-native, no libc.
     Degree-7 sin / degree-8 cos on [0, π/2], evaluated in Horner form."""
     comptime HALF_PI = Float64(1.57079632679489661923)
@@ -89,7 +141,7 @@ fn sincos[width: Int = 1](angles: SIMD[DType.float64, width]) -> SinCosResult[wi
     return SinCosResult[width](s_base * sin_sign, c_base * cos_sign)
 
 
-fn exp_f32[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+def exp_f32[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
     """Fast exp(x) for f32 via Cody-Waite range reduction + Chebyshev minimax
     polynomial. No libc. Fully branchless, SIMD-native."""
     comptime LN2_HI = Float32(0.693145751953125)
@@ -130,7 +182,7 @@ fn exp_f32[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, wid
 # ================================================================
 
 
-fn gemm_kernel[K: Int, N: Int](
+def gemm_kernel[K: Int, N: Int](
     ip: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     wp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -153,7 +205,7 @@ fn gemm_kernel[K: Int, N: Int](
             row_out[n] = acc.reduce_add().cast[DType.bfloat16]()
 
 
-fn gemv_kernel[K: Int, N: Int](
+def gemv_kernel[K: Int, N: Int](
     ip: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     wp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -199,7 +251,7 @@ fn gemv_kernel[K: Int, N: Int](
             row_out[n] = acc.reduce_add().cast[DType.bfloat16]()
 
 
-fn rmsnorm_kernel[cols: Int](
+def rmsnorm_kernel[cols: Int](
     ip: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     wp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -229,7 +281,7 @@ fn rmsnorm_kernel[cols: Int](
             (row_out + j).store((x * sv * w).cast[DType.bfloat16]())
 
 
-fn embed_lookup_kernel[cols: Int](
+def embed_lookup_kernel[cols: Int](
     tp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     tokens: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
     dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -246,7 +298,7 @@ fn embed_lookup_kernel[cols: Int](
             (out + j).store((src + j).load[width=width]())
 
 
-fn gqa_kernel[
+def gqa_kernel[
     num_heads: Int, num_kv_heads: Int, head_dim: Int,
     kv_cols: Int,
 ](
@@ -291,8 +343,7 @@ fn gqa_kernel[
                     # Phase 1: GEMV — score = dot(q, K[t]) / sqrt(d)
                     var k_row = kp + t * kv_stride + kv_head_offset
                     var dot_acc = SIMD[DType.float32, width](0)
-                    @parameter
-                    for c in range(chunks):
+                    comptime for c in range(chunks):
                         comptime off = c * width
                         var qv = bf16_to_f32[width](q_head, off)
                         var kv = bf16_to_f32[width](k_row, off)
@@ -310,8 +361,7 @@ fn gqa_kernel[
 
                     # Phase 3: V accumulation — rescale prior + add weighted V[t]
                     var v_row = vp + t * kv_stride + kv_head_offset
-                    @parameter
-                    for c in range(chunks):
+                    comptime for c in range(chunks):
                         comptime off = c * width
                         var prior = acc.slice[width, offset=off]()
                         var vv = bf16_to_f32[width](v_row, off)
@@ -322,8 +372,7 @@ fn gqa_kernel[
 
                 # Normalize and store
                 var inv_sum = 1.0 / running_sum
-                @parameter
-                for c in range(chunks):
+                comptime for c in range(chunks):
                     comptime off = c * width
                     var v = acc.slice[width, offset=off]() * inv_sum
                     (d_head + off).store(v.cast[DType.bfloat16]())
@@ -334,25 +383,26 @@ fn gqa_kernel[
 # ================================================================
 
 
-fn gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
+def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
     input: DynView[InT], weight: Bound[W], output: DynView[OutT],
-    mut pool: BurstPool,
-) where W.DTYPE == DType.bfloat16:
+    mut pool: BurstPool[],
+) -> PoolFence where W.DTYPE == DType.bfloat16:
     """dst[M,N] = input[M,K] × weight[N,K]^T. M is runtime, via BurstPool.
     For small M (decode), partitions output columns across workers.
     For large M (prefill), partitions input rows."""
-    constrained[InT.DTYPE == DType.bfloat16, "gemm: input must be bf16"]()
-    constrained[OutT.DTYPE == DType.bfloat16, "gemm: output must be bf16"]()
-    constrained[InT.COLS == W.COLS, "gemm: input K != weight K"]()
-    constrained[OutT.COLS == W.ROWS, "gemm: output N != weight N"]()
-    constrained[
-        InT.COLS % simd_width_of[DType.float32]() == 0,
-        "gemm: K must be f32-simd-aligned",
-    ]()
+    comptime assert InT.DTYPE == DType.bfloat16, "gemm: input must be bf16"
+    comptime assert OutT.DTYPE == DType.bfloat16, "gemm: output must be bf16"
+    comptime assert InT.COLS == W.COLS, "gemm: input K != weight K"
+    comptime assert OutT.COLS == W.ROWS, "gemm: output N != weight N"
+    comptime assert InT.COLS % simd_width_of[DType.float32]() == 0, "gemm: K must be f32-simd-aligned"
 
     var seq_len = input.seq_len
     if seq_len == 0:
-        return
+        return PoolFence.completed()
+
+    var fence = PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))
+    ))
 
     if seq_len < pool.capacity:
         # Decode path: partition N (output columns) across workers
@@ -372,7 +422,6 @@ fn gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
             pack[].arg5 = seq_len
 
         pool.dispatch(gemv_kernel[InT.COLS, N], pool.args_base, num_jobs)
-        pool.join()
     else:
         # Prefill path: partition M (input rows) across workers
         var num_jobs = min(seq_len, pool.capacity)
@@ -390,27 +439,25 @@ fn gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
             pack[].arg5 = 0
 
         pool.dispatch(gemm_kernel[InT.COLS, W.ROWS], pool.args_base, num_jobs)
-        pool.join()
+
+    return fence^
 
 
-fn rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
+def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
     input: DynView[InT], weight: Bound[W], output: DynView[OutT],
-    mut pool: BurstPool,
+    mut pool: BurstPool[],
     eps: Float32 = 1e-5,
-) where W.DTYPE == DType.bfloat16:
+) -> PoolFence where W.DTYPE == DType.bfloat16:
     """RMSNorm via BurstPool: output = (input / RMS(input)) * weight.
     F32 accumulation in registers, bf16 I/O."""
-    constrained[InT.DTYPE == DType.bfloat16, "rmsnorm: input must be bf16"]()
-    constrained[OutT.DTYPE == DType.bfloat16, "rmsnorm: output must be bf16"]()
-    constrained[InT.COLS == OutT.COLS, "rmsnorm: input/output cols mismatch"]()
-    constrained[
-        InT.COLS % simd_width_of[DType.float32]() == 0,
-        "rmsnorm: hidden must be f32-simd-aligned",
-    ]()
+    comptime assert InT.DTYPE == DType.bfloat16, "rmsnorm: input must be bf16"
+    comptime assert OutT.DTYPE == DType.bfloat16, "rmsnorm: output must be bf16"
+    comptime assert InT.COLS == OutT.COLS, "rmsnorm: input/output cols mismatch"
+    comptime assert InT.COLS % simd_width_of[DType.float32]() == 0, "rmsnorm: hidden must be f32-simd-aligned"
 
     var seq_len = input.seq_len
     if seq_len == 0:
-        return
+        return PoolFence.completed()
 
     var eps_copy = eps
     var eps_int = Int(UnsafePointer(to=eps_copy).bitcast[Int32]()[])
@@ -430,20 +477,22 @@ fn rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped
         pack[].arg5 = eps_int
 
     pool.dispatch(rmsnorm_kernel[InT.COLS], pool.args_base, num_jobs)
-    pool.join()
+    return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))
+    ))
 
 
-fn embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped](
+def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped](
     table: Bound[W], tokens: Int, output: DynView[OutT],
-    mut pool: BurstPool,
-) where W.DTYPE == DType.bfloat16:
+    mut pool: BurstPool[],
+) -> PoolFence where W.DTYPE == DType.bfloat16:
     """Gather: for each token ID, copy table[id] → output row."""
-    constrained[OutT.DTYPE == DType.bfloat16, "embed: output must be bf16"]()
-    constrained[W.COLS == OutT.COLS, "embed: table hidden != output hidden"]()
+    comptime assert OutT.DTYPE == DType.bfloat16, "embed: output must be bf16"
+    comptime assert W.COLS == OutT.COLS, "embed: table hidden != output hidden"
 
     var seq_len = output.seq_len
     if seq_len == 0:
-        return
+        return PoolFence.completed()
 
     var num_jobs = min(seq_len, pool.capacity)
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
@@ -460,22 +509,21 @@ fn embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped](
         pack[].arg5 = 0
 
     pool.dispatch(embed_lookup_kernel[W.COLS], pool.args_base, num_jobs)
-    pool.join()
+    return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))
+    ))
 
 
-fn silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shaped](
+def silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shaped](
     gate: DynView[GT], up: DynView[UT], dst: DynView[DstT],
 ):
     """SwiGLU: dst = silu(gate) * up. F32 compute, bf16 I/O."""
-    constrained[GT.DTYPE == DType.bfloat16, "silu_mul: gate must be bf16"]()
-    constrained[UT.DTYPE == DType.bfloat16, "silu_mul: up must be bf16"]()
-    constrained[DstT.DTYPE == DType.bfloat16, "silu_mul: dst must be bf16"]()
-    constrained[GT.COLS == UT.COLS, "silu_mul: gate/up cols mismatch"]()
-    constrained[GT.COLS == DstT.COLS, "silu_mul: gate/dst cols mismatch"]()
-    constrained[
-        GT.COLS % simd_width_of[DType.float32]() == 0,
-        "silu_mul: cols must be f32-simd-aligned",
-    ]()
+    comptime assert GT.DTYPE == DType.bfloat16, "silu_mul: gate must be bf16"
+    comptime assert UT.DTYPE == DType.bfloat16, "silu_mul: up must be bf16"
+    comptime assert DstT.DTYPE == DType.bfloat16, "silu_mul: dst must be bf16"
+    comptime assert GT.COLS == UT.COLS, "silu_mul: gate/up cols mismatch"
+    comptime assert GT.COLS == DstT.COLS, "silu_mul: gate/dst cols mismatch"
+    comptime assert GT.COLS % simd_width_of[DType.float32]() == 0, "silu_mul: cols must be f32-simd-aligned"
 
     var seq_len = gate.seq_len
     if seq_len == 0:
@@ -500,19 +548,16 @@ fn silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shape
         (dp + i).store((g * sig * u).cast[DType.bfloat16]())
 
 
-fn elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shaped](
+def elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shaped](
     a: DynView[AT], b: DynView[BT], dst: DynView[DstT],
 ):
     """Elementwise: dst = a + b. F32 compute, bf16 I/O."""
-    constrained[AT.DTYPE == DType.bfloat16, "elem_add: a must be bf16"]()
-    constrained[BT.DTYPE == DType.bfloat16, "elem_add: b must be bf16"]()
-    constrained[DstT.DTYPE == DType.bfloat16, "elem_add: dst must be bf16"]()
-    constrained[AT.COLS == BT.COLS, "elem_add: a/b cols mismatch"]()
-    constrained[AT.COLS == DstT.COLS, "elem_add: a/dst cols mismatch"]()
-    constrained[
-        AT.COLS % simd_width_of[DType.float32]() == 0,
-        "elem_add: cols must be f32-simd-aligned",
-    ]()
+    comptime assert AT.DTYPE == DType.bfloat16, "elem_add: a must be bf16"
+    comptime assert BT.DTYPE == DType.bfloat16, "elem_add: b must be bf16"
+    comptime assert DstT.DTYPE == DType.bfloat16, "elem_add: dst must be bf16"
+    comptime assert AT.COLS == BT.COLS, "elem_add: a/b cols mismatch"
+    comptime assert AT.COLS == DstT.COLS, "elem_add: a/dst cols mismatch"
+    comptime assert AT.COLS % simd_width_of[DType.float32]() == 0, "elem_add: cols must be f32-simd-aligned"
 
     var seq_len = a.seq_len
     if seq_len == 0:
@@ -535,17 +580,14 @@ fn elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shape
         (dp + i).store((av + bv).cast[DType.bfloat16]())
 
 
-fn init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
+def init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
     cos_buf: Bound[CosT], sin_buf: Bound[SinT], theta: Float64 = 10000.0,
 ) where CosT.DTYPE == DType.float32:
     """Precompute cos/sin tables for RoPE. Call once at model init."""
-    constrained[SinT.DTYPE == DType.float32, "rope init: sin must be f32"]()
-    constrained[CosT.ROWS == SinT.ROWS, "rope init: cos/sin rows mismatch"]()
-    constrained[CosT.COLS == SinT.COLS, "rope init: cos/sin cols mismatch"]()
-    constrained[
-        CosT.COLS % simd_width_of[DType.float64]() == 0,
-        "rope init: cols must be f64-simd-aligned",
-    ]()
+    comptime assert SinT.DTYPE == DType.float32, "rope init: sin must be f32"
+    comptime assert CosT.ROWS == SinT.ROWS, "rope init: cos/sin rows mismatch"
+    comptime assert CosT.COLS == SinT.COLS, "rope init: cos/sin cols mismatch"
+    comptime assert CosT.COLS % simd_width_of[DType.float64]() == 0, "rope init: cols must be f64-simd-aligned"
 
     var cp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
         unsafe_from_address=cos_buf.ptr
@@ -568,22 +610,19 @@ fn init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
             (sp + pos * half + j).store(sc.sin_val.cast[DType.float32]())
 
 
-fn rope[head_dim: Int, num_heads: Int,
+def rope[head_dim: Int, num_heads: Int,
     XT: Encoding & Shaped, CosT: Encoding & Shaped, SinT: Encoding & Shaped](
     x: DynView[XT], cos_table: Bound[CosT], sin_table: Bound[SinT], pos: Int,
 ) where CosT.DTYPE == DType.float32:
     """Rotary position embeddings, applied in-place per head."""
-    constrained[XT.DTYPE == DType.bfloat16, "rope: must be bf16"]()
-    constrained[XT.COLS == head_dim * num_heads, "rope: cols != heads * dim"]()
-    constrained[head_dim % 2 == 0, "rope: head_dim must be even"]()
-    constrained[SinT.DTYPE == DType.float32, "rope: sin table must be f32"]()
-    constrained[CosT.COLS == head_dim // 2, "rope: cos cols != head_dim/2"]()
-    constrained[SinT.COLS == head_dim // 2, "rope: sin cols != head_dim/2"]()
-    constrained[CosT.ROWS == SinT.ROWS, "rope: cos/sin capacity mismatch"]()
-    constrained[
-        (head_dim // 2) % simd_width_of[DType.float32]() == 0,
-        "rope: half must be f32-simd-aligned",
-    ]()
+    comptime assert XT.DTYPE == DType.bfloat16, "rope: must be bf16"
+    comptime assert XT.COLS == head_dim * num_heads, "rope: cols != heads * dim"
+    comptime assert head_dim % 2 == 0, "rope: head_dim must be even"
+    comptime assert SinT.DTYPE == DType.float32, "rope: sin table must be f32"
+    comptime assert CosT.COLS == head_dim // 2, "rope: cos cols != head_dim/2"
+    comptime assert SinT.COLS == head_dim // 2, "rope: sin cols != head_dim/2"
+    comptime assert CosT.ROWS == SinT.ROWS, "rope: cos/sin capacity mismatch"
+    comptime assert (head_dim // 2) % simd_width_of[DType.float32]() == 0, "rope: half must be f32-simd-aligned"
 
     var seq_len = x.seq_len
     if seq_len == 0:
@@ -623,17 +662,14 @@ fn rope[head_dim: Int, num_heads: Int,
                 )
 
 
-fn kv_cache_write[SrcT: Encoding & Shaped, CT: Encoding & Shaped](
+def kv_cache_write[SrcT: Encoding & Shaped, CT: Encoding & Shaped](
     src: DynView[SrcT], cache: CacheView[CT], pos: Int,
 ):
     """Copy src[seq_len, kv_dim] into cache at row pos."""
-    constrained[SrcT.DTYPE == DType.bfloat16, "kv_write: src must be bf16"]()
-    constrained[CT.DTYPE == DType.bfloat16, "kv_write: cache must be bf16"]()
-    constrained[SrcT.COLS == CT.COLS, "kv_write: src cols != cache cols"]()
-    constrained[
-        SrcT.COLS % simd_width_of[DType.bfloat16]() == 0,
-        "kv_write: cols must be bf16-simd-aligned",
-    ]()
+    comptime assert SrcT.DTYPE == DType.bfloat16, "kv_write: src must be bf16"
+    comptime assert CT.DTYPE == DType.bfloat16, "kv_write: cache must be bf16"
+    comptime assert SrcT.COLS == CT.COLS, "kv_write: src cols != cache cols"
+    comptime assert SrcT.COLS % simd_width_of[DType.bfloat16]() == 0, "kv_write: cols must be bf16-simd-aligned"
 
     var seq_len = src.seq_len
     if seq_len == 0:
@@ -655,30 +691,30 @@ fn kv_cache_write[SrcT: Encoding & Shaped, CT: Encoding & Shaped](
             (dst_row + j).store((src_row + j).load[width=width]())
 
 
-fn attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
+def attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     QT: Encoding & Shaped, KCT: Encoding & Shaped, VCT: Encoding & Shaped,
     OutT: Encoding & Shaped](
     q: DynView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
     output: DynView[OutT], pos: Int,
-    mut pool: BurstPool,
-) where KCT.DTYPE == DType.bfloat16:
+    mut pool: BurstPool[],
+) -> PoolFence where KCT.DTYPE == DType.bfloat16:
     """GQA attention: Q[M, H*D] attends over KV cache[0..pos+M, Hkv*D].
     Causal masked, online softmax (single-pass, no score buffer).
     Work partitioned by KV head group via BurstPool."""
-    constrained[QT.DTYPE == DType.bfloat16, "attention: Q must be bf16"]()
-    constrained[OutT.DTYPE == DType.bfloat16, "attention: output must be bf16"]()
-    constrained[VCT.DTYPE == DType.bfloat16, "attention: V cache must be bf16"]()
-    constrained[QT.COLS == num_heads * head_dim, "attention: Q cols != H*D"]()
-    constrained[OutT.COLS == QT.COLS, "attention: output cols != Q cols"]()
-    constrained[KCT.COLS == num_kv_heads * head_dim, "attention: K cache cols != Hkv*D"]()
-    constrained[VCT.COLS == KCT.COLS, "attention: V cache cols != K cache cols"]()
-    constrained[KCT.ROWS == VCT.ROWS, "attention: K/V capacity mismatch"]()
-    constrained[head_dim % simd_width_of[DType.float32]() == 0, "attention: head_dim must be f32-simd-aligned"]()
-    constrained[num_heads % num_kv_heads == 0, "attention: heads must divide evenly for GQA"]()
+    comptime assert QT.DTYPE == DType.bfloat16, "attention: Q must be bf16"
+    comptime assert OutT.DTYPE == DType.bfloat16, "attention: output must be bf16"
+    comptime assert VCT.DTYPE == DType.bfloat16, "attention: V cache must be bf16"
+    comptime assert QT.COLS == num_heads * head_dim, "attention: Q cols != H*D"
+    comptime assert OutT.COLS == QT.COLS, "attention: output cols != Q cols"
+    comptime assert KCT.COLS == num_kv_heads * head_dim, "attention: K cache cols != Hkv*D"
+    comptime assert VCT.COLS == KCT.COLS, "attention: V cache cols != K cache cols"
+    comptime assert KCT.ROWS == VCT.ROWS, "attention: K/V capacity mismatch"
+    comptime assert head_dim % simd_width_of[DType.float32]() == 0, "attention: head_dim must be f32-simd-aligned"
+    comptime assert num_heads % num_kv_heads == 0, "attention: heads must divide evenly for GQA"
 
     var seq_len = q.seq_len
     if seq_len == 0:
-        return
+        return PoolFence.completed()
 
     var pos_seq = (pos << 32) | seq_len
 
@@ -700,4 +736,6 @@ fn attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
         gqa_kernel[num_heads, num_kv_heads, head_dim, KCT.COLS],
         pool.args_base, num_jobs,
     )
-    pool.join()
+    return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))
+    ))

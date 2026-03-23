@@ -1,20 +1,21 @@
-from memory import Span
+from std.memory import Span, UnsafePointer
 
 from .capabilities import ByteTransformCapability, PreTokenizerCapability
 from .shared_capabilities import (
-    bytes_to_gpt2,
-    gpt2_to_bytes,
     is_ascii_letter,
     is_ascii_digit,
     is_ascii_regex_space,
+    is_ascii_punct_symbol,
     decode_utf8_codepoint,
     in_unicode_ranges,
     is_unicode_letter_cp,
     is_unicode_number_cp,
     is_unicode_whitespace_cp,
+    is_unicode_punct_symbol_cp,
     is_number_start_at,
     is_whitespace_start_at,
     span_to_string,
+    consume_codepoint_run,
 )
 from .unicode_props import (
     LETTER_RANGES,
@@ -34,38 +35,19 @@ from .unicode_psm_props import (
 
 
 @always_inline
-fn is_ascii_punct_symbol(b: Byte) -> Bool:
-    return (
-        (b >= Byte(33) and b <= Byte(47))
-        or (b >= Byte(58) and b <= Byte(64))
-        or (b >= Byte(91) and b <= Byte(96))
-        or (b >= Byte(123) and b <= Byte(126))
-    )
-
-
-@always_inline
-fn is_newline_byte(b: Byte) -> Bool:
+def is_newline_byte(b: Byte) -> Bool:
     return b == Byte(10) or b == Byte(13)
 
 
 @always_inline
-fn is_unicode_mark_cp(cp: UInt32, mark_ranges: UnsafePointer[UInt32]) -> Bool:
+def is_unicode_mark_cp(cp: UInt32, mark_ranges: UnsafePointer[UInt32, _]) -> Bool:
     if cp < MARK_MIN or cp > MARK_MAX:
         return False
     return in_unicode_ranges(cp, mark_ranges, MARK_PAIR_COUNT)
 
 
 @always_inline
-fn is_unicode_punct_symbol_cp(cp: UInt32, punct_symbol_ranges: UnsafePointer[UInt32]) -> Bool:
-    if cp < UInt32(0x80):
-        return is_ascii_punct_symbol(Byte(cp))
-    if cp < PUNCT_SYMBOL_MIN or cp > PUNCT_SYMBOL_MAX:
-        return False
-    return in_unicode_ranges(cp, punct_symbol_ranges, PUNCT_SYMBOL_PAIR_COUNT)
-
-
-@always_inline
-fn is_cjk_japanese_cp(cp: UInt32) -> Bool:
+def is_cjk_japanese_cp(cp: UInt32) -> Bool:
     return (
         (cp >= UInt32(0x4E00) and cp <= UInt32(0x9FA5))
         or (cp >= UInt32(0x3040) and cp <= UInt32(0x309F))
@@ -74,44 +56,44 @@ fn is_cjk_japanese_cp(cp: UInt32) -> Bool:
 
 
 @always_inline
-fn is_letter_mark_cp(
+def is_letter_mark_cp(
     cp: UInt32,
-    letter_ranges: UnsafePointer[UInt32],
-    mark_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
+    mark_ranges: UnsafePointer[UInt32, _],
 ) -> Bool:
     return is_unicode_letter_cp(cp, letter_ranges) or is_unicode_mark_cp(cp, mark_ranges)
 
 
 @always_inline
-fn is_letter_mark_start_at(
-    data: Span[Byte],
+def is_letter_mark_start_at(
+    data: Span[Byte, _],
     pos: Int,
     n: Int,
-    letter_ranges: UnsafePointer[UInt32],
-    mark_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
+    mark_ranges: UnsafePointer[UInt32, _],
 ) -> Bool:
     var parsed = decode_utf8_codepoint(data, pos, n)
     return is_letter_mark_cp(parsed[0], letter_ranges, mark_ranges)
 
 
 @always_inline
-fn is_punct_symbol_start_at(
-    data: Span[Byte],
+def is_punct_symbol_start_at(
+    data: Span[Byte, _],
     pos: Int,
     n: Int,
-    punct_symbol_ranges: UnsafePointer[UInt32],
+    punct_symbol_ranges: UnsafePointer[UInt32, _],
 ) -> Bool:
     var parsed = decode_utf8_codepoint(data, pos, n)
     return is_unicode_punct_symbol_cp(parsed[0], punct_symbol_ranges)
 
 
 @always_inline
-fn consume_letter_mark_run(
-    data: Span[Byte],
+def consume_letter_mark_run(
+    data: Span[Byte, _],
     start: Int,
     n: Int,
-    letter_ranges: UnsafePointer[UInt32],
-    mark_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
+    mark_ranges: UnsafePointer[UInt32, _],
 ) -> Int:
     var i = start
     while i < n:
@@ -122,25 +104,18 @@ fn consume_letter_mark_run(
     return i
 
 
-@always_inline
-fn consume_punct_symbol_run(
-    data: Span[Byte],
+def consume_punct_symbol_run(
+    data: Span[Byte, _],
     start: Int,
     n: Int,
-    punct_symbol_ranges: UnsafePointer[UInt32],
+    punct_symbol_ranges: UnsafePointer[UInt32, _],
 ) -> Int:
-    var i = start
-    while i < n:
-        var parsed = decode_utf8_codepoint(data, i, n)
-        if not is_unicode_punct_symbol_cp(parsed[0], punct_symbol_ranges):
-            break
-        i += parsed[1]
-    return i
+    return consume_codepoint_run[is_unicode_punct_symbol_cp](data, start, n, punct_symbol_ranges)
 
 
-fn split_numbers_piece(
+def split_numbers_piece(
     piece: String,
-    number_ranges: UnsafePointer[UInt32],
+    number_ranges: UnsafePointer[UInt32, _],
     mut out: List[String],
 ):
     var data = piece.as_bytes()
@@ -174,7 +149,7 @@ fn split_numbers_piece(
         out.append(span_to_string(data, chunk_start, n))
 
 
-fn split_cjk_piece(piece: String, mut out: List[String]):
+def split_cjk_piece(piece: String, mut out: List[String]):
     var data = piece.as_bytes()
     var n = len(data)
     if n == 0:
@@ -207,10 +182,10 @@ fn split_cjk_piece(piece: String, mut out: List[String]):
 
 
 @always_inline
-fn is_branch_b_prefix_cp(
+def is_branch_b_prefix_cp(
     cp: UInt32,
-    letter_ranges: UnsafePointer[UInt32],
-    punct_symbol_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
+    punct_symbol_ranges: UnsafePointer[UInt32, _],
 ) -> Bool:
     if cp == UInt32(10) or cp == UInt32(13):
         return False
@@ -221,14 +196,14 @@ fn is_branch_b_prefix_cp(
     return True
 
 
-fn try_match_main_pattern(
-    data: Span[Byte],
+def try_match_main_pattern(
+    data: Span[Byte, _],
     pos: Int,
     end: Int,
-    letter_ranges: UnsafePointer[UInt32],
-    mark_ranges: UnsafePointer[UInt32],
-    punct_symbol_ranges: UnsafePointer[UInt32],
-    whitespace_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
+    mark_ranges: UnsafePointer[UInt32, _],
+    punct_symbol_ranges: UnsafePointer[UInt32, _],
+    whitespace_ranges: UnsafePointer[UInt32, _],
 ) -> Int:
     var b = data[pos]
 
@@ -300,12 +275,12 @@ fn try_match_main_pattern(
     return -1
 
 
-fn split_main_piece(
+def split_main_piece(
     piece: String,
-    letter_ranges: UnsafePointer[UInt32],
-    mark_ranges: UnsafePointer[UInt32],
-    punct_symbol_ranges: UnsafePointer[UInt32],
-    whitespace_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
+    mark_ranges: UnsafePointer[UInt32, _],
+    punct_symbol_ranges: UnsafePointer[UInt32, _],
+    whitespace_ranges: UnsafePointer[UInt32, _],
     mut out: List[String],
 ):
     var data = piece.as_bytes()
@@ -317,13 +292,8 @@ fn split_main_piece(
     var chunk_start = 0
     while i < n:
         var match_end = try_match_main_pattern(
-            data,
-            i,
-            n,
-            letter_ranges,
-            mark_ranges,
-            punct_symbol_ranges,
-            whitespace_ranges,
+            data, i, n,
+            letter_ranges, mark_ranges, punct_symbol_ranges, whitespace_ranges,
         )
         if match_end > i:
             if chunk_start < i:
@@ -341,21 +311,15 @@ fn split_main_piece(
 
 
 struct DeepSeekV3ByteTransform(ByteTransformCapability):
-    fn __init__(out self):
+    def __init__(out self):
         pass
-
-    fn encode_bytes(self, data: Span[Byte]) -> String:
-        return bytes_to_gpt2(data)
-
-    fn decode_bytes(self, text: String) -> List[Byte]:
-        return gpt2_to_bytes(text)
 
 
 struct DeepSeekV3PreTokenizer(PreTokenizerCapability):
-    fn __init__(out self):
+    def __init__(out self):
         pass
 
-    fn pre_tokenize(self, text: String) -> List[String]:
+    def pre_tokenize(self, text: String) -> List[String]:
         var result = List[String]()
         if text.byte_length() == 0:
             return result^
@@ -382,10 +346,7 @@ struct DeepSeekV3PreTokenizer(PreTokenizerCapability):
         for i in range(len(stage2)):
             split_main_piece(
                 stage2[i],
-                letter_ptr,
-                mark_ptr,
-                punct_symbol_ptr,
-                whitespace_ptr,
+                letter_ptr, mark_ptr, punct_symbol_ptr, whitespace_ptr,
                 result,
             )
 

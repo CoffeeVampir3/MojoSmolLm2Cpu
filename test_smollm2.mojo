@@ -1,22 +1,26 @@
 """Autoregressive generation test: tokenize a prompt, prefill, then
-decode 30 tokens greedily. Reports load time, per-token forward time,
-and the final generated sequence."""
+decode tokens greedily. Reports load time, per-token forward time,
+and the final generated sequence.
 
-from memory import UnsafePointer
-from sys.info import simd_width_of
-from pathlib import Path
-from time import perf_counter_ns
+Uses the parametric SmolLM2TP with TP=1."""
+
+from std.memory import UnsafePointer
+from std.sys.info import simd_width_of
+from std.pathlib import Path
+from std.time import perf_counter_ns
 
 from tokenizer import load_tokenizer
-from experimental4.smollm2 import LogitsView, SmolLM2Loaded, SmolLM2Config, MODEL_PATH, BF16
+from experimental4.smollm2 import LogitsView, SmolLM2Config, BF16
+from experimental4.smollm2_tp import SmolLM2TP
 
 
 comptime TOKENIZER_PATH = "checkpoints/SmolLM2/tokenizer.json"
+comptime MODEL_PATH = "checkpoints/SmolLM2/model.safetensors"
 comptime VOCAB = SmolLM2Config.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 512
 
 
-fn greedy_argmax(view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
+def greedy_argmax(view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
     """Greedy decode: return (token_id, logit) with highest value in last row."""
     comptime width = simd_width_of[DType.float32]()
     var last = view.rows() - 1
@@ -33,7 +37,7 @@ fn greedy_argmax(view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
     return (best_idx, best_val)
 
 
-fn main():
+def main():
     # --- Load tokenizer ---
     var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
     if not tok_opt:
@@ -69,9 +73,9 @@ He was named to the 2022 class of ACM Fellows"""
         print("", token_ids[i], end="")
     print()
 
-    # --- Load model ---
+    # --- Load model (parametric TP=1) ---
     var t0 = perf_counter_ns()
-    var model_opt = SmolLM2Loaded[BF16, 1].load(Path(MODEL_PATH), 0)
+    var model_opt = SmolLM2TP[BF16, 1].load(Path(MODEL_PATH))
     if not model_opt:
         return
     var model = model_opt.take()
@@ -79,17 +83,21 @@ He was named to the 2022 class of ACM Fellows"""
     print("model loaded in", load_ms, "ms")
     print()
 
-    # --- Prefill: forward the full prompt ---
-    var seq_len = len(token_ids)
+    # --- Write tokens into rank 0's scratch area ---
+    var rv = model.rank(0)
+    var tokens_addr = rv.scratch_slot(0)
     var tp = UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-        unsafe_from_address=model.scratch_ptr()
+        unsafe_from_address=tokens_addr
     )
+
+    var seq_len = len(token_ids)
     for i in range(seq_len):
         tp[i] = Scalar[DType.int32](token_ids[i])
 
+    # --- Prefill: forward the full prompt ---
     print("--- prefill profile ---")
     var t1 = perf_counter_ns()
-    var logits = model.forward(model.scratch_ptr(), seq_len, 0, profile=True)
+    var logits = model.forward(tokens_addr, seq_len, 0, profile=True)
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
     var result = greedy_argmax(logits)
     var next_id = result[0]
@@ -111,7 +119,7 @@ He was named to the 2022 class of ACM Fellows"""
     for step in range(1, MAX_NEW_TOKENS):
         tp[0] = Scalar[DType.int32](next_id)
 
-        logits = model.forward(model.scratch_ptr(), 1, pos, profile=False)
+        logits = model.forward(tokens_addr, 1, pos, profile=False)
 
         result = greedy_argmax(logits)
         next_id = result[0]
