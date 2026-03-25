@@ -11,30 +11,31 @@ for input projections (allreduce after). Dispatch via parallel_for.
 
 from std.pathlib import Path
 
-from std.memory import UnsafePointer, memcpy
+from std.memory import UnsafePointer
 from std.collections import InlineArray
-from std.sys.info import simd_width_of
 from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
 
-from experimental4.model_spec import (
+from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32,
     RowShard, ColShard, Replicated,
     PrincipleNodeLocal,
+    IsQuantizable, IsPassthrough,
     Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
     WeightIterable,
     next_offset,
     DEFAULT_ALIGNMENT,
     Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig,
 )
-from experimental4.kernel_ops import (
+from kernels.kernel_ops import (
     gemm, rmsnorm, embed_lookup, silu_mul, elem_add, rope, kv_cache_write,
     attention, init_rope_tables,
     PoolFence, parallel, parallel_for,
 )
-from experimental4.loader import load_safetensors
-from experimental4.profiler import Profiler
+from kernels.reductions import ring_allreduce, ring_broadcast
+from modeling.loader import load_safetensors
+from kernels.profiler import Profiler
 
 
 # =============================================================================
@@ -97,13 +98,13 @@ comptime C = SmolLM2Config
 
 
 struct TPLayer[E: Encoding, tp: Int]:
-    comptime Q_PROJ      = PlacedSlot[Self.E, RowShard, C.HIDDEN, C.HIDDEN, Self.tp, 0, "self_attn.q_proj.weight"]
-    comptime K_PROJ      = PlacedSlot[Self.E, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](), "self_attn.k_proj.weight"]
-    comptime V_PROJ      = PlacedSlot[Self.E, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.K_PROJ](), "self_attn.v_proj.weight"]
-    comptime O_PROJ      = PlacedSlot[Self.E, ColShard, C.HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.V_PROJ](), "self_attn.o_proj.weight"]
-    comptime GATE_PROJ   = PlacedSlot[Self.E, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.O_PROJ](), "mlp.gate_proj.weight"]
-    comptime UP_PROJ     = PlacedSlot[Self.E, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "mlp.up_proj.weight"]
-    comptime DOWN_PROJ   = PlacedSlot[Self.E, ColShard, C.HIDDEN, C.INTERMEDIATE, Self.tp, next_offset[Self.UP_PROJ](), "mlp.down_proj.weight"]
+    comptime Q_PROJ      = PlacedSlot[Self.E, RowShard, C.HIDDEN, C.HIDDEN, Self.tp, 0, "self_attn.q_proj.weight", IsQuantizable]
+    comptime K_PROJ      = PlacedSlot[Self.E, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](), "self_attn.k_proj.weight", IsQuantizable]
+    comptime V_PROJ      = PlacedSlot[Self.E, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.K_PROJ](), "self_attn.v_proj.weight", IsQuantizable]
+    comptime O_PROJ      = PlacedSlot[Self.E, ColShard, C.HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.V_PROJ](), "self_attn.o_proj.weight", IsQuantizable]
+    comptime GATE_PROJ   = PlacedSlot[Self.E, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.O_PROJ](), "mlp.gate_proj.weight", IsQuantizable]
+    comptime UP_PROJ     = PlacedSlot[Self.E, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "mlp.up_proj.weight", IsQuantizable]
+    comptime DOWN_PROJ   = PlacedSlot[Self.E, ColShard, C.HIDDEN, C.INTERMEDIATE, Self.tp, next_offset[Self.UP_PROJ](), "mlp.down_proj.weight", IsQuantizable]
     comptime INPUT_NORM  = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, next_offset[Self.DOWN_PROJ](), "input_layernorm.weight"]
     comptime POST_ATTN_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, next_offset[Self.INPUT_NORM](), "post_attention_layernorm.weight"]
     comptime STRIDE      = next_offset[Self.POST_ATTN_NORM]()
@@ -307,112 +308,6 @@ struct Ranks[E: Encoding, tp: Int]:
 
 
 # =============================================================================
-# Stubs
-# =============================================================================
-
-
-def ring_allreduce[T: Encoding & Shaped, tp: Int](
-    ptrs: InlineArray[Int, tp], seq_len: Int,
-):
-    """Ring allreduce: reduce-scatter then allgather with SIMD accumulation.
-
-    After completion, every buffer contains the element-wise sum of all tp
-    input buffers. bf16 data with f32 SIMD accumulation. Ring topology
-    ensures each communication step traverses one NUMA hop.
-    """
-    comptime cols = T.COLS
-    var total_elements = seq_len * cols
-    if total_elements <= 0 or tp <= 1:
-        return
-
-    var chunk_size = total_elements // tp
-    var remainder = total_elements - chunk_size * tp
-    comptime width = simd_width_of[DType.float32]()
-
-    @always_inline
-    def chunk_start(c: Int) -> Int:
-        return c * chunk_size
-
-    @always_inline
-    def chunk_len(c: Int) -> Int:
-        if c == tp - 1:
-            return chunk_size + remainder
-        return chunk_size
-
-    @always_inline
-    def accumulate(dst_ptr: Int, src_ptr: Int, start: Int, length: Int):
-        """dst[start:start+length] += src[start:start+length] in bf16 with f32 SIMD."""
-        var src = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=src_ptr)
-        var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst_ptr)
-        var i = 0
-        while i + width <= length:
-            var s_raw = (src + start + i).bitcast[Scalar[DType.uint16]]().load[width=width]()
-            var d_raw = (dst + start + i).bitcast[Scalar[DType.uint16]]().load[width=width]()
-            var s_f32 = SIMD[DType.float32, width](from_bits=s_raw.cast[DType.uint32]() << 16)
-            var d_f32 = SIMD[DType.float32, width](from_bits=d_raw.cast[DType.uint32]() << 16)
-            (dst + start + i).store((s_f32 + d_f32).cast[DType.bfloat16]())
-            i += width
-        while i < length:
-            var s = Float32(src[start + i])
-            var d = Float32(dst[start + i])
-            dst[start + i] = Scalar[DType.bfloat16](s + d)
-            i += 1
-
-    # --- Phase 1: Reduce-scatter ---
-    for step in range(tp - 1):
-        for rank in range(tp):
-            var c = (rank - step + tp) % tp
-            var next_rank = (rank + 1) % tp
-            accumulate(ptrs[next_rank], ptrs[rank], chunk_start(c), chunk_len(c))
-
-    # --- Phase 2: Allgather ---
-    for step in range(tp - 1):
-        for rank in range(tp):
-            var c = (rank - step + 1 + tp) % tp
-            var next_rank = (rank + 1) % tp
-            var cs = chunk_start(c)
-            var cl = chunk_len(c)
-            memcpy(
-                dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptrs[next_rank] + cs * T.ELEMENT_BYTES),
-                src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptrs[rank] + cs * T.ELEMENT_BYTES),
-                count=cl * T.ELEMENT_BYTES,
-            )
-
-
-def ring_broadcast[T: Encoding & Shaped, tp: Int](
-    src_ptr: Int, dst_ptrs: InlineArray[Int, tp], seq_len: Int,
-):
-    """Ring broadcast: forward data along the ring, one hop per step.
-
-    Step 0: ensure dst_ptrs[0] has the data (copy from src if needed).
-    Step s (s=0..tp-2): rank s forwards to rank s+1.
-
-    Each copy traverses one ring edge (minimum NUMA distance). Spreads
-    memory bandwidth across all controllers instead of bottlenecking
-    at the source rank.
-    """
-    var total_bytes = seq_len * T.COLS * T.ELEMENT_BYTES
-    if total_bytes <= 0 or tp <= 1:
-        return
-
-    # Ensure rank 0 has the data.
-    if src_ptr != dst_ptrs[0]:
-        memcpy(
-            dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=dst_ptrs[0]),
-            src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=src_ptr),
-            count=total_bytes,
-        )
-
-    # Forward along the ring: rank 0 → 1 → 2 → ... → tp-1.
-    for step in range(tp - 1):
-        memcpy(
-            dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=dst_ptrs[step + 1]),
-            src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=dst_ptrs[step]),
-            count=total_bytes,
-        )
-
-
-# =============================================================================
 # Loaded model
 # =============================================================================
 
@@ -502,7 +397,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
         # --- Embed (host rank, then broadcast) ---
         embed_lookup(host.weight[M.EMBED](), tokens_ptr, host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
-        ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len)
+        ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
         for layer_idx in range(C.NUM_LAYERS):
             @parameter
@@ -549,7 +444,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
                 return gemm(rv.attn_out_view(seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_o]()
 
-            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len)
+            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
             @parameter
             def do_res_add(rv: RankView[Self.E, Self.tp]):
@@ -581,11 +476,11 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
                 return gemm(rv.mlp_view(0, seq_len), rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_down]()
 
-            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len)
+            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
             ranks.each[do_res_add]()
 
-            _ = layer_idx  # Anchor: closures capture layer_idx but compiler doesn't see it
+            _ = layer_idx  # Anchor: closures capture layer_idx but compiler doesn't track it
 
         # --- Final norm + LM head (host rank only) ---
         rmsnorm(host.x_main(seq_len), host.weight[M.FINAL_NORM](), host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
@@ -594,10 +489,6 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
         gemm(host.x_main(seq_len), host.weight[M.EMBED](), logits, ranks.pool_ptrs[0][]).join()
         prof.finish()
         prof.report()
-
-        _ = ranks
-        _ = self.pools
-        _ = self.arenas
 
         return LogitsView[C.VOCAB_SIZE](logits.ptr, seq_len)
 

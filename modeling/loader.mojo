@@ -1,12 +1,14 @@
 from std.pathlib import Path
+from std.memory import UnsafePointer
 
-from experimental4.model_spec import (
+from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, byte_count,
     NodeLocal,
     WeightIterable, WeightDesc, weight_desc,
 )
 from safetensors.parser import parse_safetensors_header
-from safetensors.loader import IoLoader, ReadOp, Completion, print_io_load_error
+from linux.io_uring import IoRing, ReadOp, Completion
+from safetensors.loader import process_read_queue, LoadError
 
 
 comptime DEFAULT_IO_DEPTH = 2048
@@ -119,8 +121,7 @@ def load_safetensors[
     var fragments = List[ReadFragment]()
     var tp = len(arena_bases)
 
-    for i in range(len(node_local_weights)):
-        var w = node_local_weights[i].copy()
+    for w in node_local_weights:
         var meta_opt = header.tensors.get(w.name)
         if not meta_opt:
             print("missing tensor:", w.name)
@@ -130,8 +131,7 @@ def load_safetensors[
             return None
         emit_reads(w, header.data_offset + meta.start, arena_bases[host_index], host_index, fragments)
 
-    for i in range(len(distributed_weights)):
-        var w = distributed_weights[i].copy()
+    for w in distributed_weights:
         var meta_opt = header.tensors.get(w.name)
         if not meta_opt:
             print("missing tensor:", w.name)
@@ -143,27 +143,28 @@ def load_safetensors[
             emit_reads(w, header.data_offset + meta.start, arena_bases[rank], rank, fragments)
 
     var num_fragments = len(fragments)
-    var ops = List[ReadOp](capacity=num_fragments)
+    var ops = List[ReadOp[]](capacity=num_fragments)
     for i in range(num_fragments):
         var frag = fragments[i].copy()
         ops.append(ReadOp(
             file_idx=0,
             offset=frag.file_offset,
             length=frag.length,
-            dest=frag.dest,
+            dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=frag.dest),
             id=i,
         ))
 
-    var loader = IoLoader[io_depth]()
-    if not loader:
+    var ring = IoRing[io_depth]()
+    if not ring:
         print("io_uring setup failed")
         return None
 
     var paths = List[Path]()
     paths.append(path)
-    var registered = loader.register_files(paths)
-    if registered < 0:
-        print("register_files failed, errno:", registered)
+    try:
+        _ = ring.register_files(paths)
+    except err:
+        print("register_files failed:", err.error_message())
         return None
 
     var bytes_loaded = 0
@@ -172,9 +173,9 @@ def load_safetensors[
     def on_complete(c: Completion):
         bytes_loaded += Int(c.result)
 
-    var err = loader.process_queue_checked[on_complete](ops)
+    var err = process_read_queue[on_complete](ring, ops)
     if err:
-        print_io_load_error(err.value())
+        print("load error:", err.value().msg)
         return None
 
     return LoadResult(bytes_loaded, num_fragments)
